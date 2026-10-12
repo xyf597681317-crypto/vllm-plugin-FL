@@ -37,6 +37,9 @@ def apply_ascend_patches():
         apply_ascend_mla_prefill_backend_patch,
     )
     from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_deepseek_v4 import apply_deepseek_v4_patches
+    from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_triton_ops import (
+        apply_triton_ops_patch,
+    )
     from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_minimax_m3 import (
         apply_minimax_m3_patches,
     )
@@ -74,6 +77,9 @@ def apply_ascend_patches():
     apply_qwen3vl_patch()
     patch_op_cls()
     patch_fused_moe()
+    # Register the migrated FlagGems Triton operators for `_C_ascend`.
+    # Enabled by USE_FLAGGEMS (or VLLM_FL_TRITON_OPS); idempotent per process.
+    apply_triton_ops_patch()
     _patches_applied = True
 
 

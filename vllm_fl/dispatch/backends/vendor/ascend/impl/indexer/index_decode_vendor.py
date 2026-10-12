@@ -126,8 +126,8 @@ def _decode_index_score_kernel(
     q_ids = pid_r * decode_query_len + q_offsets
 
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+        pass  # gdc_wait (CUDA-only, no-op on NPU)
+        pass  # gdc_launch_dependents (CUDA-only, no-op on NPU)
 
     seq_len = tl.load(seq_lens + pid_r)
     query_pos = seq_len - decode_query_len + q_offsets
@@ -419,7 +419,7 @@ def minimax_m3_index_decode(
         BLOCK_SIZE_K=2048,
     )
 
-    use_pdl = current_platform.is_arch_support_pdl()
+    use_pdl = _is_arch_support_pdl()
     launch_kwargs = {"launch_pdl": True} if use_pdl else {}
     decode_query_tile_size = triton.next_power_of_2(max_decode_query_len)
     decode_score_grid = lambda metadata: (
