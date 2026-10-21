@@ -1,21 +1,482 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
-# Adapted from https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/ops/triton/mamba/causal_conv1d.py
-# adapted from vllm/model_executor/layers/mamba/ops/causal_conv1d.py
-# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+# Triton implementation of the AscendC operator of the same name (see csrc/ascend).
 # SPDX-License-Identifier: Apache-2.0
+"""causal_conv1d -- AscendC to Triton port
 
-# Copyright (c) 2024, Tri Dao.
-# Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
-# and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
-# mypy: ignore-errors
+Source: csrc/ascend/moe/causal_conv1d/
+Interface (op_host/causal_conv1d_def.cpp L24-73 + tiling_utils.h L20-31):
+    Input : x              [T, dim] (varlen/prefill) or [batch, seqlen, dim] (3D decode)
+                           or [batch, dim] (2D decode, seqlen=1)      fp16/bf16
+            weight         [width, dim]            fp16/bf16
+            bias           [dim]                   (OPTIONAL)
+            convStates     [numCache, stateLen, dim]  fp16/bf16 (in/out)
+            queryStartLoc  [batch+1]               int32/int64 (OPTIONAL)
+            cacheIndices   [batch]                 int32/int64 (OPTIONAL)
+            initialStateMode [batch]               bool/int32/int64 (OPTIONAL)
+            numAcceptedTokens [batch]              int32/int64 (OPTIONAL, speculative decoding)
+    Output: y              [T, dim] (same shape as x)    same dtype as x
+    Attr: activationMode(0=none/1=silu), padSlotId=-1, runMode(0=fn/1=update)
 
-from typing import Any, Optional
+**Accepted calling forms** (schema of `csrc/ascend/torch_binding.cpp` L1165-1169, call site
+`vllm_fl/dispatch/backends/vendor/ascend/impl/gdn.py` L199-303):
+    npu_causal_conv1d_custom(output, x, weight, conv_state, bias_opt, query_start_loc_opt,
+                             cache_indices_opt, initial_state_mode_opt, num_accepted_tokens_opt,
+                             activation_mode:int, pad_slot_id:int, run_mode:int) -> Tensor
+
+  Form A -- AscendC contract, **output first and written in place** (the schema order, and the
+            order the migrated call sites use):
+        causal_conv1d_fn(output, x, weight, conv_state=..., bias_opt=...,
+                         query_start_loc_opt=..., cache_indices_opt=...,
+                         initial_state_mode_opt=..., num_accepted_tokens_opt=...,
+                         activation_mode=..., pad_slot_id=..., run_mode=...)
+    `output` is filled in place (a `copy_` is used when it is a strided view, so a caller that
+    keeps its own view of the buffer still observes the result) and is also returned.
+  Form B -- position-sorted entry used by the `_C_ascend` bridge/adapter, output passed by keyword:
+        causal_conv1d_fn(x, weight, conv_state=..., bias_opt=..., ..., run_mode=..., out=output)
+
+  Form A is selected unambiguously by the third positional argument: the AscendC contract puts
+  `weight` there, i.e. a 2-D `[width, dim]` tensor with `2 <= width <= 4` (`MAX_WIDTH`), while
+  Form B only ever passes the 1-D `[dim]` bias (or `None`) in that slot. `output=` may also be
+  given explicitly in either form. If the first two positional arguments do not then have the
+  same shape, the call is rejected instead of silently computing the wrong thing.
+
+This implementation accepts both the call-site names (`*_opt` / `conv_state` / `activation_mode`)
+and the snake_case names.
+
+Formulas (op_kernel/causal_conv1d.h):
+  InitRing (L351-393): the first (width-1) ring slots = convStates[cacheIdx, stateTokenOffset+i, :]
+      (zeroed when hasInit is false, L376-381); hasInit = initialStateMode[seq] (L945-947)
+  RunSeq (L415-470): for t in [0,len):
+      acc = bias                                                        # L429-433
+      for j in [MAX_WIDTH-width, MAX_WIDTH): tap = MAX_WIDTH-1-j        # L435-446
+          slot = (tap==0) ? ring[current token] : ring[token(t-tap)]    # L437
+          acc += fp32(ring[slot]) * weight[j]
+      => y[t] = bias + sum_{k=0..width-1} weight[k] * ext[t+k]
+         ext = [old state (width-1 historical tokens), x[start..start+len)]
+      activationMode!=0 -> Silu(acc)                                    # L450-452
+  WriteBackState (L717-737): state[pos] = ext[len+pos], pos in [0,width-2)
+      (WriteBackStateSpec L740-830 is the equivalent fast path for width==4 with a large enough
+      stateLen)
+      a slot with cacheIdx == padSlotId is not processed (L933-936)
+  Task window (L52-94 + tiling_validation.h L89-121):
+      inputMode=0 varlen: start=qsl[b], len=qsl[b+1]-qsl[b] (x is [cuSeqlen, dim])
+      inputMode=1 3D: start=b*seqLen, len=seqLen (x is [batch, seqlen, dim])
+      inputMode=2 2D: start=b, len=1 (x is [batch, dim], decode)
+  Speculative decoding (L1009-1018): numAcceptedTokens[b] -> stateTokenOffset = clamp(nat-1, 0, stateLen-(width-1))
+      i.e. the state is read starting from that offset (sliding window); the write-back is still ext[len+pos]
+
+Triton implementation notes / semantic assumptions:
+  1. runMode=0/1 are both supported; the window mode is derived from the shape of x and
+     queryStartLoc (consistent with tiling_validation).
+  2. Accumulation is fp32 (matching the kernel, which casts to fp32 before the multiply-add) and the
+     final result is rounded to nearest in place.
+  3. AscendC only allows numAcceptedTokens when width==4 (validation L362); this implementation
+     likewise only treats it as speculative decoding under that condition and ignores it otherwise.
+  4. One program handles one (batch, dim tile) and advances serially along t (the inherent dependency
+     of a causal convolution).
+  5. **Constraint**: within a single call, the cacheIndices of the batches must point to pairwise
+     distinct state slots (the production path satisfies this; slots marked by pad_slot_id are
+     skipped). AscendC processes batches serially, so when two live batches reuse a slot the later
+     one reads the state written back by the earlier one; the Triton side is batch-parallel and
+     cannot reproduce that serial side effect (it would be a data race).
+"""
+
+from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+PAD_SLOT_ID = -1
+
+#: `MAX_WIDTH` of the AscendC operator (tiling_utils.h): a `[width, dim]` weight with a first
+#: dimension in this range is what makes the AscendC positional form (Form A) recognisable.
+MAX_WIDTH = 4
+
+#: sentinel for "keyword not passed", which matters because several AscendC keywords are
+#: meaningful when passed as an explicit `None` (e.g. `initial_state_mode_opt=None` means
+#: "reuse the state stored in conv_state", it is not the same as "not passed").
+_UNSET = object()
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _next_pow2(n: int) -> int:
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
+def _is_ascendc_weight(candidate, dim: int) -> bool:
+    """True when the *third* positional argument is an AscendC `weight` `[width, dim]`.
+
+    The AscendC contract is `(output, x, weight, conv_state, ...)`, so in the
+    `(x, weight, ...)` form the same slot only ever holds a 1-D `[dim]` bias or `None`.
+    """
+    if not torch.is_tensor(candidate) or candidate.dim() != 2:
+        return False
+    return 2 <= candidate.shape[0] <= MAX_WIDTH and candidate.shape[1] == dim
+
+
+def _resolve_out(out, x: torch.Tensor):
+    """Return `(buffer, copy_back_target)` for the `[T, dim]` kernel result.
+
+    `out` is used directly when it is a contiguous buffer of the very same shape; otherwise a
+    fresh contiguous buffer is returned together with the tensor that has to receive a
+    `copy_` afterwards. That keeps a strided view (or a differently shaped view of the same
+    storage) both correct and observably written in place.
+    """
+    if out is None:
+        return torch.empty_like(x), None
+    if not torch.is_tensor(out):
+        raise TypeError(f"output/out must be a Tensor, got {type(out).__name__}")
+    if out.dtype != x.dtype:
+        raise TypeError(f"output/out dtype {out.dtype} must match x dtype {x.dtype}")
+    if out.numel() != x.numel():
+        raise ValueError(
+            f"output/out has {out.numel()} elements but x has {x.numel()}")
+    if out.is_contiguous() and tuple(out.shape) == tuple(x.shape):
+        return out, None
+    return torch.empty_like(x), out
+
+
+@triton.jit
+def _causal_conv1d_kernel(
+    X, W, BIAS, STATES, QSL, CACHE_IDX, INIT_MODE, NAT, Y,
+    BATCH, DIM, T, SEQ_LEN,
+    PAD_SLOT_ID_V,
+    WIDTH: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    WINDOW_MODE: tl.constexpr,      # 0=varlen, 1=batch3d, 2=decode2d
+    HAS_BIAS: tl.constexpr,
+    HAS_CACHE_IDX: tl.constexpr,
+    HAS_INIT_MODE: tl.constexpr,
+    HAS_NAT: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    BLK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    nchunk = tl.cdiv(DIM, BLK_D)
+    b = pid // nchunk
+    c = pid % nchunk
+    if b >= BATCH:
+        return
+    d = c * BLK_D + tl.arange(0, BLK_D)
+    dmask = d < DIM
+
+    if WINDOW_MODE == 0:
+        start = tl.load(QSL + b)
+        end = tl.load(QSL + b + 1)
+        length = end - start
+    elif WINDOW_MODE == 1:
+        start = b * SEQ_LEN
+        length = SEQ_LEN
+    else:
+        start = b
+        length = 1
+
+    if HAS_CACHE_IDX:
+        cache_idx = tl.load(CACHE_IDX + b)
+    else:
+        cache_idx = b
+    if HAS_INIT_MODE:
+        has_init = tl.load(INIT_MODE + b) != 0
+    else:
+        # note: **when initial_state_mode is not passed, the native behavior is to reuse
+        #   conv_state**, not to assume "no initial state". Measured:
+        #     `initial_state_mode_opt=None`: native y_err = 1.953e-03 (bf16 floor) -- it read conv_state;
+        #                                    ours y_err = 1.378e-01 -- the old code zeroed the whole
+        #                                    history here.
+        #   The parameter exists to **turn the initial state off** (the first block of a prefill has no
+        #   history), not to turn it on.
+        #   The call site `impl/gdn.py` L207 (the spec path) passes None, so the old implementation
+        #   necessarily produced silently wrong values in the model.
+        has_init = True
+    sto = 0
+    if HAS_NAT:
+        sto = tl.minimum(tl.maximum(tl.load(NAT + b) - 1, 0), STATE_LEN - (WIDTH - 1))
+
+    bias = tl.zeros([BLK_D], dtype=tl.float32)
+    if HAS_BIAS:
+        bias = tl.load(BIAS + d, mask=dmask, other=0.0).to(tl.float32)
+
+    skip = (cache_idx == PAD_SLOT_ID_V) & HAS_CACHE_IDX
+    state_base = cache_idx * STATE_LEN * DIM + d
+    write_state = not skip
+
+    for t in range(length):
+        acc = bias
+        for k in tl.static_range(WIDTH):
+            i = t + k                      # coordinate in ext
+            src = i - (WIDTH - 1)          # corresponding x row offset (<0 means take the old state)
+            vx = tl.load(X + (start + src) * DIM + d,
+                         mask=(src >= 0) & dmask & (start + src < T) & (start + src >= 0), other=0.0).to(tl.float32)
+            vs = tl.load(STATES + state_base + (sto + i) * DIM,
+                         mask=(src < 0) & (i < WIDTH - 1) & dmask & write_state,
+                         other=0.0).to(tl.float32)
+            # note (second site): **a pad slot has to be skipped on reads as well**.
+            #   The old code only skipped the write (`write_state`), but the `cache_idx` of a pad slot
+            #   is -1 (the call site passes `cache_idx=[0,-1,1,-1], pad_slot=-1`), so `state_base`
+            #   became a **negative offset** => an **out-of-bounds read** => garbage/NaN (that case
+            #   measured `y_err=nan`). The AscendC semantics are "when cacheIdx == padSlotId the slot
+            #   is not processed" (neither written, nor read for history).
+            vs = tl.where(has_init & (src < 0) & write_state, vs, 0.0)
+            w = tl.load(W + k * DIM + d, mask=dmask, other=0.0).to(tl.float32)
+            acc += (vx + vs) * w
+        if ACTIVATION:
+            acc = acc / (1.0 + tl.exp(0.0 - acc))       # Silu
+        tl.store(Y + (start + t) * DIM + d, acc.to(Y.dtype.element_ty), mask=dmask)
+
+    # state write-back: new_state[pos] = ext[length+pos] (equivalent to WriteBackState / WriteBackStateSpec)
+    for pos in tl.static_range(WIDTH - 1):
+        i = length + pos
+        src = i - (WIDTH - 1)
+        vx = tl.load(X + (start + src) * DIM + d,
+                     mask=(src >= 0) & dmask & (start + src < T) & (start + src >= 0), other=0.0).to(tl.float32)
+        vs = tl.load(STATES + state_base + (sto + i) * DIM,
+                     mask=(src < 0) & (i < WIDTH - 1) & dmask & write_state,
+                     other=0.0).to(tl.float32)
+        vs = tl.where(has_init & (src < 0) & write_state, vs, 0.0)
+        tl.store(STATES + state_base + pos * DIM, (vx + vs).to(STATES.dtype.element_ty),
+                 mask=dmask & write_state & (length > 0))
+
+
+def _causal_conv1d_ascendc(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    conv_states: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    cache_indices: torch.Tensor | None = None,
+    initial_state_mode: torch.Tensor | None = None,
+    activation: int | str | None = 0,
+    pad_slot_id: int = PAD_SLOT_ID,
+    run_mode: int = 0,
+    num_accepted_tokens: torch.Tensor | None = None,
+    conv_state: torch.Tensor | None = None,
+    bias_opt: torch.Tensor | None = None,
+    query_start_loc_opt: torch.Tensor | None = None,
+    cache_indices_opt: torch.Tensor | None = None,
+    initial_state_mode_opt=_UNSET,
+    num_accepted_tokens_opt=_UNSET,
+    activation_mode=_UNSET,
+    has_initial_state: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Equivalent of the AscendC CausalConv1d (npu_causal_conv1d_custom).
+
+    Two positional layouts are accepted (see the module docstring):
+
+      * AscendC / schema order -- ``(output, x, weight, ...)`` with the output written in
+        place. Recognised by the third positional being a 2-D ``[width, dim]`` weight, or by
+        passing ``output=`` explicitly. The schema is
+        ``npu_causal_conv1d_custom(Tensor output, Tensor x, Tensor weight, Tensor conv_state,
+        Tensor? bias_opt, ..., int activation_mode, int pad_slot_id, int run_mode) -> Tensor``
+        and the migrated call sites keep exactly that order.
+      * implementation order -- ``(x, weight, ...)`` with the output passed as ``out=`` (or
+        allocated internally).
+
+    Arguments are accepted under both the call-site names (`conv_state` / `bias_opt` /
+    `query_start_loc_opt` / `cache_indices_opt` / `initial_state_mode_opt` /
+    `num_accepted_tokens_opt` / `activation_mode`) and the snake_case names; when both are given,
+    the `*_opt` form wins.
+
+    Args:
+        x: [T, dim] (varlen) / [batch, seqlen, dim] (3D decode) / [batch, dim] (2D decode)
+        weight: [width, dim]
+        conv_states / conv_state: [numCache, stateLen, dim], **updated in place**
+        query_start_loc(_opt): [batch+1]; required in varlen/3D mode
+        cache_indices(_opt): [batch], defaults to the batch index
+        initial_state_mode(_opt) / has_initial_state: [batch]; true means reuse the initial state
+            stored in conv_states
+        activation / activation_mode: 0/None for none, 1/"silu" for SiLU
+        pad_slot_id: a cache slot matching this id is not processed (no state write-back)
+        run_mode: 0=fn(prefill), 1=update/decode
+        num_accepted_tokens(_opt): [batch], sliding offset of the state read under speculative decoding
+        out / output: output tensor, same shape/dtype as x; **filled in place**. Allocated
+            internally when neither is given. `output` is the AscendC name, `out` the
+            implementation name; passing either selects the AscendC semantics for that tensor.
+
+    Returns:
+        the output tensor (`output`/`out` when one was given, the fresh tensor otherwise)
+    """
+    # ---- AscendC positional form: (output, x, weight, ...) --------------------------------
+    output = out if output is None else output
+    if output is None and _is_ascendc_weight(bias, x.shape[-1]):
+        # `x`/`weight`/`bias` hold the AscendC `output`/`x`/`weight` here.
+        output, x, weight, bias = x, weight, bias, None
+    if output is not None:
+        if not torch.is_tensor(output) or not torch.is_tensor(x) or not torch.is_tensor(weight):
+            raise TypeError(
+                "causal_conv1d_fn(output, x, weight, ...) requires three tensors; got "
+                f"{type(output).__name__}, {type(x).__name__}, {type(weight).__name__}")
+        if tuple(output.shape) != tuple(x.shape):
+            raise ValueError(
+                "AscendC contract violated: the in-place output "
+                f"{tuple(output.shape)} must have the same shape as x {tuple(x.shape)}")
+        if output.numel() == 0:
+            return output
+        _causal_conv1d_impl(
+            x, weight, bias=bias, conv_states=conv_states,
+            query_start_loc=query_start_loc, cache_indices=cache_indices,
+            initial_state_mode=initial_state_mode, activation=activation,
+            pad_slot_id=pad_slot_id, run_mode=run_mode,
+            num_accepted_tokens=num_accepted_tokens, conv_state=conv_state,
+            bias_opt=bias_opt, query_start_loc_opt=query_start_loc_opt,
+            cache_indices_opt=cache_indices_opt,
+            initial_state_mode_opt=initial_state_mode_opt,
+            num_accepted_tokens_opt=num_accepted_tokens_opt,
+            activation_mode=activation_mode, has_initial_state=has_initial_state,
+            out=output)
+        return output
+    return _causal_conv1d_impl(
+        x, weight, bias=bias, conv_states=conv_states, query_start_loc=query_start_loc,
+        cache_indices=cache_indices, initial_state_mode=initial_state_mode,
+        activation=activation, pad_slot_id=pad_slot_id, run_mode=run_mode,
+        num_accepted_tokens=num_accepted_tokens, conv_state=conv_state, bias_opt=bias_opt,
+        query_start_loc_opt=query_start_loc_opt, cache_indices_opt=cache_indices_opt,
+        initial_state_mode_opt=initial_state_mode_opt,
+        num_accepted_tokens_opt=num_accepted_tokens_opt, activation_mode=activation_mode,
+        has_initial_state=has_initial_state, out=out)
+
+
+def _causal_conv1d_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    conv_states: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    cache_indices: torch.Tensor | None = None,
+    initial_state_mode: torch.Tensor | None = None,
+    activation: int | str | None = 0,
+    pad_slot_id: int = PAD_SLOT_ID,
+    run_mode: int = 0,
+    num_accepted_tokens: torch.Tensor | None = None,
+    conv_state: torch.Tensor | None = None,
+    bias_opt: torch.Tensor | None = None,
+    query_start_loc_opt: torch.Tensor | None = None,
+    cache_indices_opt: torch.Tensor | None = None,
+    initial_state_mode_opt=_UNSET,
+    num_accepted_tokens_opt=_UNSET,
+    activation_mode=_UNSET,
+    has_initial_state: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Kernel entry point (form B); `causal_conv1d_fn` resolves the positional layout first."""
+    bias = bias_opt if bias_opt is not None else bias
+    conv_states = conv_state if conv_state is not None else conv_states
+    query_start_loc = query_start_loc_opt if query_start_loc_opt is not None else query_start_loc
+    cache_indices = cache_indices_opt if cache_indices_opt is not None else cache_indices
+    if initial_state_mode_opt is not _UNSET:
+        initial_state_mode = initial_state_mode_opt
+    elif has_initial_state is not None:
+        initial_state_mode = has_initial_state
+    nat = num_accepted_tokens_opt if num_accepted_tokens_opt is not _UNSET else num_accepted_tokens
+    if activation_mode is not _UNSET:
+        activation = activation_mode
+    act_on = activation not in (None, 0, False, "none")
+    if isinstance(activation, str):
+        assert activation in ("silu", "swish"), "activation only supports None/'silu'/'swish'"
+
+    assert conv_states is not None, "conv_states/conv_state must be provided"
+    assert x.dim() in (2, 3), f"x must be 2D/3D, got {tuple(x.shape)}"
+    dim = x.shape[-1]
+    width = weight.shape[0]
+    assert weight.shape == (width, dim), f"weight must be [{width},{dim}], got {tuple(weight.shape)}"
+    assert 2 <= width <= 4, f"width={width} is out of range (AscendC MAX_WIDTH=4)"
+    state_len = conv_states.shape[1]
+    assert state_len >= width - 1, f"stateLen={state_len} < width-1={width - 1}"
+    assert conv_states.shape[2] == dim
+
+    if x.dim() == 3:
+        batch, seq_len = x.shape[0], x.shape[1]
+        T = batch * seq_len
+        window_mode = 1
+    elif query_start_loc is not None:
+        batch = query_start_loc.numel() - 1
+        seq_len = 1
+        T = x.shape[0]
+        window_mode = 0
+    else:
+        batch = x.shape[0]
+        seq_len = 1
+        T = batch
+        window_mode = 2
+    if run_mode not in (0, 1):
+        raise ValueError("run_mode only supports 0(fn)/1(update)")
+
+    has_nat = nat is not None and width == 4
+    if nat is not None and not has_nat:
+        raise NotImplementedError("AscendC only supports num_accepted_tokens when width=4")
+    assert x.dtype == weight.dtype == conv_states.dtype
+    if bias is not None:
+        assert bias.numel() == dim and bias.dtype == x.dtype
+
+    dev = x.device
+    x = x.contiguous()
+    weight = weight.contiguous()
+    y, copy_back = _resolve_out(out, x)
+    blk_d = min(_next_pow2(dim), 512)
+
+    _causal_conv1d_kernel[(batch * _ceil_div(dim, blk_d),)](
+        x, weight, bias if bias is not None else x, conv_states,
+        query_start_loc.to(torch.int32).contiguous() if query_start_loc is not None else x,
+        cache_indices.to(torch.int32).contiguous() if cache_indices is not None else x,
+        initial_state_mode.contiguous() if initial_state_mode is not None else x,
+        nat.to(torch.int32).contiguous() if nat is not None else x,
+        y,
+        batch, dim, T, seq_len,
+        int(pad_slot_id),
+        WIDTH=width,
+        STATE_LEN=state_len,
+        WINDOW_MODE=window_mode,
+        HAS_BIAS=bias is not None,
+        HAS_CACHE_IDX=cache_indices is not None,
+        HAS_INIT_MODE=initial_state_mode is not None,
+        HAS_NAT=has_nat,
+        ACTIVATION=bool(act_on),
+        BLK_D=blk_d,
+    )
+    if copy_back is not None:
+        copy_back.copy_(y.reshape(copy_back.shape))
+        return copy_back
+    return y
+
+
+def _causal_conv1d_update_ascendc(*args, **kwargs) -> torch.Tensor:
+    """Call-site-name compatible entry point (equivalent to causal_conv1d_fn(run_mode=1)).
+
+    The call site looks like: causal_conv1d_update(x=..., conv_state=..., weight=..., bias=...,
+    activation=..., conv_state_indices=..., num_accepted_tokens=..., query_start_loc=...,
+    max_query_len=..., pad_slot_id=...)
+    """
+    kwargs = dict(kwargs)
+    if "conv_state_indices" in kwargs and "cache_indices" not in kwargs:
+        kwargs["cache_indices"] = kwargs.pop("conv_state_indices")
+    kwargs.pop("max_query_len", None)
+    kwargs.pop("block_idx_last_scheduled_token", None)
+    kwargs.pop("initial_state_idx", None)
+    kwargs.pop("validate_data", None)
+    kwargs["run_mode"] = 1
+    return causal_conv1d_fn(*args, **kwargs)
+
+# ==========================================================================================
+# Legacy vLLM-compatible surface (kept verbatim)
+# ==========================================================================================
+# `vllm_fl/dispatch/backends/vendor/ascend/patch.py::patch_causal_conv1d` installs
+# `causal_conv1d_fn` / `causal_conv1d_update_npu` from this module into vLLM's
+# `model_executor.layers.mamba.ops.causal_conv1d`, whose callers use vLLM's own layout
+# (`x` is `[dim, cu_seqlen]`, the state is `(..., dim, width-1)`, `activation="silu"`,
+# `metadata=`). That contract is unrelated to the AscendC one and has to keep working
+# unchanged, so the original implementation is retained here and the public
+# `causal_conv1d_fn` below only routes to it when the AscendC layout is not in use.
+from typing import Any, Optional
+
+import torch.nn.functional as F
 
 
 def causal_conv1d_ref(
@@ -61,7 +522,7 @@ def causal_conv1d_ref(
     return (out, None) if not return_final_states else (out, final_states_out)
 
 
-def causal_conv1d_fn(
+def _causal_conv1d_fn_vllm(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -713,3 +1174,70 @@ def causal_conv1d_update_npu(
     if unsqueeze:
         out = out.squeeze(-1)
     return out.to(original_x_dtype)
+
+# ==========================================================================================
+# Public entry points
+# ==========================================================================================
+def causal_conv1d_fn(x, weight, bias=None, activation="silu", conv_states=None,
+                     has_initial_state=None, cache_indices=None, query_start_loc=None,
+                     metadata=None, pad_slot_id=PAD_SLOT_ID, **kwargs):
+    """CausalConv1d under both the AscendC contract and the vLLM contract.
+
+    AscendC (`npu_causal_conv1d_custom`, schema of `csrc/ascend/torch_binding.cpp`
+    L1165-1169, used by the migrated call sites in `impl/gdn.py`)::
+
+        causal_conv1d_fn(output, x, weight, conv_state=..., bias_opt=...,
+                         query_start_loc_opt=..., cache_indices_opt=...,
+                         initial_state_mode_opt=..., num_accepted_tokens_opt=...,
+                         activation_mode=..., pad_slot_id=..., run_mode=...)
+
+    `output` is filled **in place** (via `copy_` when it is a strided view, so a caller
+    that keeps its own view of the buffer sees the result) and returned. This form is
+    selected when `output=`/`out=` is given, when one of the AscendC-only keyword names is
+    used, or when the third positional argument is a 2-D `[width, dim]` weight -- which is
+    unambiguous, because the vLLM contract only ever puts a 1-D `[dim]` bias (or `None`)
+    in that slot. If the output and the input then do not have the same shape the call is
+    rejected instead of silently computing the wrong tensor.
+
+    vLLM (`patch_causal_conv1d`)::
+
+        causal_conv1d_fn(x, weight, bias, activation, conv_states, has_initial_state,
+                         cache_indices, query_start_loc, metadata, pad_slot_id)
+
+    with `x` of shape `[dim, cu_seqlen]`; unchanged, served by `_causal_conv1d_fn_vllm`.
+    """
+    if ("output" in kwargs or "out" in kwargs or "conv_state" in kwargs
+            or "bias_opt" in kwargs or "run_mode" in kwargs
+            or "query_start_loc_opt" in kwargs or "cache_indices_opt" in kwargs
+            or "initial_state_mode_opt" in kwargs or "num_accepted_tokens_opt" in kwargs
+            or "activation_mode" in kwargs
+            or _is_ascendc_weight(bias, x.shape[-1] if torch.is_tensor(x) else -1)):
+        out = kwargs.pop("output", None)
+        out = kwargs.pop("out", None) if out is None else out
+        call = dict(kwargs)
+        call.setdefault("conv_states", conv_states)
+        call.setdefault("query_start_loc", query_start_loc)
+        call.setdefault("cache_indices", cache_indices)
+        call.setdefault("initial_state_mode", None)
+        call.setdefault("has_initial_state", has_initial_state)
+        call.setdefault("pad_slot_id", pad_slot_id)
+        if activation != "silu":
+            call.setdefault("activation", activation)
+        return _causal_conv1d_ascendc(x, weight, bias, out=out, **call)
+    return _causal_conv1d_fn_vllm(
+        x, weight, bias=bias, activation=activation, conv_states=conv_states,
+        has_initial_state=has_initial_state, cache_indices=cache_indices,
+        query_start_loc=query_start_loc, metadata=metadata, pad_slot_id=pad_slot_id)
+
+
+def causal_conv1d_update(*args, **kwargs):
+    """AscendC update/decode entry point (`run_mode=1`); see `causal_conv1d_fn`.
+
+    `causal_conv1d_update_npu` above is a different, older entry point (vLLM layout) and
+    is intentionally left untouched.
+    """
+    return _causal_conv1d_update_ascendc(*args, **kwargs)
+
+
+__all__ = ["causal_conv1d_fn", "causal_conv1d_update", "causal_conv1d_update_npu",
+           "causal_conv1d_ref", "PAD_SLOT_ID"]

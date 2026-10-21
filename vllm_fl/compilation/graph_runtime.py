@@ -88,6 +88,10 @@ class GraphRuntimeController:
         self._ubatch_wrapper_type = ubatch_wrapper_type
         self._update_attention_tasks = update_attention_tasks
         self._attention_impls: tuple[type[Any], ...] | None = None
+        # The optional replay-prepare hook is a separate lifecycle: compressed
+        # attention disables update_graph_params, yet its capture-baked kernel
+        # inputs still need refreshing before every replay.
+        self._prepare_impls: tuple[type[Any], ...] | None = None
         self.phase = GraphPhase.IDLE
         self._update_stream: Any | None = None
 
@@ -194,9 +198,18 @@ class GraphRuntimeController:
                 forward_context.capturing = False
 
     def before_replay(self, forward_context: Any) -> None:
-        """Wait for the previous replay before enqueueing the next graph."""
+        """Wait for the previous replay, then let backends refresh replayed state."""
         if self.device_type == "npu":
             self.platform.torch_device_fn.current_stream().synchronize()
+            # Optional per-backend hook: some paths derive kernel inputs on the host, so
+            # the values baked at capture go stale.  Refreshing HERE (before the graph is
+            # enqueued, on the current stream) makes stream ordering sufficient -- no
+            # events and no dependence on after_replay timing.
+            prepare = None
+            for attention_impl in self._resolve_prepare_impls():
+                prepare = getattr(attention_impl, "prepare_replay", None)
+                if prepare is not None:
+                    prepare(forward_context, self._num_tokens(forward_context))
 
     def after_replay(self, forward_context: Any) -> None:
         """Update NPU task parameters after replay enqueue releases its event."""
@@ -237,6 +250,19 @@ class GraphRuntimeController:
 
         return self._attention_impls
 
+    def _resolve_prepare_impls(self) -> tuple[type[Any], ...]:
+        """Resolve the backends whose optional replay-prepare hook must run.
+
+        ``prepare_replay`` is a separate lifecycle from ``update_graph_params``:
+        compressed attention disables the update list, yet the kernel inputs
+        that were baked into its captured graph still go stale between replays.
+        Controllers that never bound attention groups keep the historical
+        fallback through :meth:`_resolve_attention_impls`.
+        """
+        if self._prepare_impls is not None:
+            return self._prepare_impls
+        return self._resolve_attention_impls()
+
     def set_attention_impls(self, implementations: tuple[type[Any], ...]) -> None:
         """Freeze attention graph updaters resolved during runner setup.
 
@@ -253,12 +279,21 @@ class GraphRuntimeController:
         Compressed attention models deliberately disable attention task updates.
         Keep initialization aligned with capture and replay: do not ask backend
         factories for an updater that cannot be used on that path.
+
+        The optional replay-prepare hook is bound independently of that
+        decision: it is not part of the update lifecycle and must run for the
+        models that disable it as well.
         """
         implementations: tuple[type[Any], ...]
         if self._update_attention_tasks:
             implementations = self.resolve_attention_impls(attn_groups)
+            self._prepare_impls = implementations
         else:
             implementations = ()
+            # The update lifecycle is disabled, but the prepare hook is not part
+            # of it: resolve it from the same groups so compressed-attention
+            # replays still refresh the kernel inputs that capture froze.
+            self._prepare_impls = self.resolve_prepare_impls(attn_groups)
         self.set_attention_impls(implementations)
         return implementations
 
@@ -303,6 +338,48 @@ class GraphRuntimeController:
                         f"provide update_graph_params(): {backend.__name__} -> "
                         f"{impl_cls.__name__}"
                     )
+                if impl_cls not in seen_impls:
+                    seen_impls.add(impl_cls)
+                    implementations.append(impl_cls)
+        return tuple(implementations)
+
+    @staticmethod
+    def resolve_prepare_impls(attn_groups: Any) -> tuple[type[Any], ...]:
+        """Resolve optional replay-prepare hooks from initialized groups.
+
+        ``prepare_replay`` refreshes host-derived kernel inputs before a replay
+        is enqueued, so it is needed even on compressed-attention paths that
+        deliberately disable ``update_graph_params``.  Resolve by backend
+        capability, deduplicate by implementation class, and keep the same
+        cache-only skip as :meth:`resolve_attention_impls`.
+
+        Resolution is best-effort: the hook is optional, so a backend whose
+        factory cannot run outside its setup context is skipped instead of
+        failing graph binding.  The required update list stays fail-closed.
+        """
+        from vllm.v1.attention.backend import AttentionBackend
+
+        seen_backends: set[type[Any]] = set()
+        seen_impls: set[type[Any]] = set()
+        implementations: list[type[Any]] = []
+        for groups in attn_groups:
+            for group in groups:
+                backend = group.backend
+                if backend in seen_backends:
+                    continue
+                seen_backends.add(backend)
+                get_impl_cls = getattr(backend, "get_impl_cls", None)
+                if (
+                    get_impl_cls is None
+                    or get_impl_cls is AttentionBackend.get_impl_cls
+                ):
+                    continue
+                try:
+                    impl_cls = get_impl_cls()
+                except Exception:  # noqa: BLE001
+                    continue
+                if not callable(getattr(impl_cls, "prepare_replay", None)):
+                    continue
                 if impl_cls not in seen_impls:
                     seen_impls.add(impl_cls)
                     implementations.append(impl_cls)

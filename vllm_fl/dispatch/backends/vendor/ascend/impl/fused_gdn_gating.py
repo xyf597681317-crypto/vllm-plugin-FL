@@ -95,12 +95,32 @@ def fused_gdn_gating_patch(
         progs = num_cores
         FACTOR = 8 * num_heads
         row_per_core = triton.cdiv(batch, num_cores)
-        BLK_BATCHES = (
+        _blk_batches_formula = (
             triton.next_power_of_2(
                 triton.cdiv(UNIFIED_BUFFER_SIZE, FACTOR * BLK_HEADS) // a.element_size()
             )
             // 2
         )
+        # The formula above is not a budget by itself: it divides the buffer by
+        # (8 * num_heads * BLK_HEADS) and by the element size, i.e. it models ONE
+        # bf16 element per slot and ignores the address tensor, the fp32
+        # intermediates, and the multi-buffer copies the compiler names in the error.
+        # Contain the tile to the MEASURED boundary, explicitly.
+        BLK_BATCHES = min(_blk_batches_formula, BLK_BATCHES_MAX)
+        # WHY THERE IS NO `assert`/`raise` HERE ABOUT THE CLAMP ITSELF:
+        #   * `assert BLK_BATCHES <= BLK_BATCHES_MAX` would be a TAUTOLOGY (min(x,MAX)
+        #     <= MAX always) -- a dead guard that provides no safety net; and `python -O`
+        #     strips asserts, which is why this repo puts guards in explicit `raise`s.
+        #   * `raise` when the clamp bites would be WRONG here: at num_heads=16/elem=2
+        #     the formula evaluates to 512, and clamping it to 256 is exactly the
+        #     measured-good fix.  Raising would turn the configuration we must fix into
+        #     a hard failure.
+        #   * Clamping DOWN is safe by construction: the clamp only ever REUSES the
+        #     values the original code already used in its passing branches
+        #     (_blk_batches_formula//2 in {128, 256}), so no new configuration is
+        #     introduced, and ROW_ITER absorbs the difference.
+        # The remaining unknown is the one the device must answer: whether the clamped
+        # tile fits for every (num_heads, elem_size).  See BLK_BATCHES_MAX below.
         ROW_ITER = triton.cdiv(row_per_core, BLK_BATCHES)
 
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
@@ -125,3 +145,20 @@ def fused_gdn_gating_patch(
         ROW_ITER=ROW_ITER,
     )
     return g, beta_output
+
+# ---------------------------------------------------------------------------
+# UB budget for fused_gdn_gating_kernel (defined at L16, per the compiler's own
+# loc("...fused_gdn_gating.py":16:0) -- keep that line number stable).
+#
+# The budget is enforced by BiShengIR's ConvertLinalgRToBinary stage, NOT by the
+# front end: a `warmup()`-only check stops at TTIR, so every tile size "compiles"
+# there and a warmup-based sweep proves nothing about this budget.
+#
+# Calibration on the real pipeline (num_heads=16, elem=2, BLK_HEADS=8):
+#     BLK_BATCHES=512 -> FAIL: "ub overflow, requires 1843968 bits while
+#                              1572864 bits available"           (= 1.1724x)
+#     BLK_BATCHES=256 -> PASS (compiled AND ran)
+# BLK_BATCHES feeds tl.arange, so it must be a power of two => the only legal
+# values are 256 and 512 => the measured boundary IS the cap.  No interpolation
+# and no per-element bit constant is needed.
+BLK_BATCHES_MAX = 256

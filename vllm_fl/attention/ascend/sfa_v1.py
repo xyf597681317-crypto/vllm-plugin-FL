@@ -203,6 +203,14 @@ class AscendSFAMetadata:
     block_table: torch.Tensor
     sin: torch.Tensor
     cos: torch.Tensor
+    # T-035: HOST mirror of `cum_query_lens`, handed to sparse_flash_attention so
+    # the operator never has to read the lengths off the device (a device->host
+    # copy aborts ACL graph capture: aclrtMemcpy 107030 / 107027).
+    # NOTE: keep this AFTER every non-default field.  A `@dataclass` rejects a
+    # non-default field that follows a defaulted one, and the error is raised at
+    # import time (TypeError: non-default argument 'block_table' follows default
+    # argument), so this must remain the last init field before the defaults run.
+    cum_query_lens_cpu: torch.Tensor | None = None
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
@@ -338,6 +346,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        # T-035: HOST mirror of `cum_query_lens`.  `query_start_loc_cpu` is already a
+        # host tensor (attention.py:363/388 use it to build the device one), so this
+        # slice is pure host bookkeeping with NO device->host copy.  It is what lets
+        # sparse_flash_attention avoid `.cpu()` inside the captured region.
+        _qsl_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+        cum_query_lens_cpu = None if _qsl_cpu is None else _qsl_cpu[1 : num_reqs + 1]
 
         # Prefer _seq_lens_cpu (always available, updated during draft
         # iterations) over seq_lens_cpu (None in async spec decode mode).
@@ -451,6 +465,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=num_actual_tokens,
             cum_query_lens=cum_query_lens,
+            cum_query_lens_cpu=cum_query_lens_cpu,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             slot_mapping=slot_mapping,
@@ -650,6 +665,33 @@ class AscendSFAImpl(MLAAttentionImpl):
     ):
         # sfa does not need to update graph params
         pass
+
+    @staticmethod
+    def prepare_replay(forward_context, num_tokens):
+        """Refill SFA's host-derived index buffers before replay on the CURRENT stream.
+
+        Called from GraphRuntimeController.before_replay, i.e. BEFORE the graph is
+        enqueued, and on the current stream, so stream ordering guarantees the replay
+        kernels observe these writes.  No events / no graph_task_update_* needed.
+        """
+        from vllm_fl.dispatch.backends.vendor.ascend.impl.sparse_flash_attention import (
+            refresh_sfa_meta_buffers,
+        )
+
+        metadata = getattr(forward_context, "attn_metadata", None)
+        if metadata is None:
+            return
+        # attn_metadata is an OBJECT for SFA but possibly a dict for other backends;
+        # handle both so this hook is safe regardless of how it is populated.
+        candidates = list(metadata.values()) if hasattr(metadata, "values") else [metadata]
+        for md in candidates:
+            cpu_q = getattr(md, "cum_query_lens_cpu", None)
+            if cpu_q is None:
+                cpu_q = getattr(md, "_seq_lens_cpu", None)
+            cpu_kv = getattr(md, "seq_lens_cpu", None)
+            if cpu_kv is None:
+                cpu_kv = getattr(md, "_seq_lens_cpu", None)
+            refresh_sfa_meta_buffers(num_tokens, cpu_q, cpu_kv)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # NOTE: We currently do not support quant kv_b_proj.
@@ -1429,7 +1471,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         topk_indices_buffer.copy_(topk_indices_to_cache)
 
     def _execute_sparse_flash_attention_process(
-        self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+        self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query,
+        actual_seq_lengths_key, cpu_actual_seq_lengths_query=None, cpu_actual_seq_lengths_key=None,
     ):
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
@@ -1440,6 +1483,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
+            cpu_actual_seq_lengths_query,
+            cpu_actual_seq_lengths_key,
         )
 
     def _record_dcp_query_gather_context(
@@ -1596,9 +1641,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             slot_mapping_cp = attn_metadata.dsa_cp_context.slot_mapping_cp
             actual_seq_lengths_query = attn_metadata.dsa_cp_context.actual_seq_lengths_query
             actual_seq_lengths_key = attn_metadata.dsa_cp_context.actual_seq_lengths_key
+            # T-035: the DSA-CP branch REWRITES the lengths on the device (see
+            # _build_metadata: local_query_lens = torch.cumsum(...)), so there is no
+            # pre-existing host mirror to reuse here.  Pass None: the operator's
+            # explicit guard then raises with a clear message instead of doing a
+            # capture-illegal device->host copy, and instead of silently reusing a
+            # mirror that would describe different sequences.
+            cpu_actual_seq_lengths_query = None
+            cpu_actual_seq_lengths_key = None
         else:
             actual_seq_lengths_query = attn_metadata.cum_query_lens
             actual_seq_lengths_key = attn_metadata.seq_lens
+            # T-035: hand over the host mirrors so sparse_flash_attention never has
+            # to read these off the device during graph capture.
+            cpu_actual_seq_lengths_query = getattr(attn_metadata, "cum_query_lens_cpu", None)
+            cpu_actual_seq_lengths_key = getattr(attn_metadata, "seq_lens_cpu", None)
         # DCP replicated indexer stores LI cache with the full/no-CP metadata, while
         # SFA KV remains stored with the DCP-sharded slot mapping.
         slot_mapping_sfa = (
@@ -1901,6 +1958,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
+            cpu_actual_seq_lengths_query,
+            cpu_actual_seq_lengths_key,
         )
 
         attn_output = self._v_up_proj(attn_output)

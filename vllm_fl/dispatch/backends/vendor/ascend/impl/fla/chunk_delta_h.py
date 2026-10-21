@@ -181,6 +181,7 @@ def chunk_gated_delta_rule_fwd_h(
     w: torch.Tensor,
     u: torch.Tensor,
     g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
@@ -188,9 +189,26 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
+    use_exp2: bool = False,
+    transpose_state_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
+    # AscendC-only keywords (see the module note in the patch that added them).
+    if transpose_state_layout:
+        raise NotImplementedError(
+            "chunk_gated_delta_rule_fwd_h: transpose_state_layout=True is not supported")
+    if gk is not None or use_exp2:
+        from vllm.model_executor.layers.fla.ops.chunk_delta_h import (
+            chunk_gated_delta_rule_fwd_h as _native_fwd_h,
+        )
+        return _native_fwd_h(
+            k=k, w=w, u=u, g=g, gk=gk, initial_state=initial_state,
+            output_final_state=output_final_state, chunk_size=chunk_size,
+            save_new_value=save_new_value, cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
+            use_exp2=use_exp2,
+        )
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = chunk_size
@@ -215,7 +233,6 @@ def chunk_gated_delta_rule_fwd_h(
     final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
-    g = g.transpose(1, 2).contiguous()
 
     def grid(meta):
         return (1, N * H)

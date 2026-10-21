@@ -27,6 +27,173 @@ from .utils import input_guard, prepare_final_chunk_indices
 from .wy_fast import recompute_w_u_fwd
 
 
+def _require_device_tensor(value, name):
+    # Shared guard for every path that hands a tensor to a Triton kernel.
+    #
+    # WHY THIS IS A SEPARATE FUNCTION (T-059): the first fix put the check inside
+    # one branch only, so an already-materialised host tensor slipped through the
+    # "return value unchanged" path and reached the kernel.  Centralising it means
+    # all callers get the same guarantee, and it is testable in isolation.
+    #
+    # The runtime requires the pointer to be DEVICE-resident; a host tensor dies in
+    # triton-ascend .../third_party/ascend/backend/driver.py:565 after
+    # aclrtPointerGetAttributes() reports a non-DEVICE location, with the message
+    #     ValueError: Pointer argument (at N) cannot be accessed from Triton
+    #                (cpu tensor?)
+    # Failing here instead turns "some pointer at N is on cpu" into a message that
+    # names the argument and its actual device.
+    dev = getattr(value, "device", None)
+    if dev is not None and dev.type == "cpu":
+        raise ValueError(
+            "%s is a CPU tensor (device=%s) but is passed to a Triton kernel, which "
+            "requires a device-resident pointer argument "
+            "(runtime error: 'Pointer argument (at N) cannot be accessed from Triton "
+            "(cpu tensor?)'). Move it to the compute device before the launch."
+            % (name, dev)
+        )
+    return value
+
+
+def _as_tensor_arg(value, name, device):
+    # Contract adapter for arguments that are handed to a Triton kernel.
+    #
+    # The AscendC metadata builder stores `cu_seqlens_kern` as a plain
+    # `tuple[int, ...]` (gdn_attn_builder.py:93, "cu_seqlens_kern: tuple[int, ...]
+    # | None"), because the AscendC operator consumed it host-side.  The Python
+    # implementation this call site now targets declares
+    #     cu_seqlens: torch.LongTensor | None = None
+    # (chunk_delta_h.py:188) and launches a Triton kernel with it.  Triton's
+    # binder calls `mangle_type(arg)` on every non-constexpr argument, which does
+    # `arg.dtype` (triton/runtime/jit.py:316) -- so a tuple blows up with
+    #     AttributeError: 'tuple' object has no attribute 'dtype'
+    # even when the kernel would not read the value (IS_VARLEN is derived from
+    # `cu_seqlens is not None`, but the dtype mangling happens regardless).
+    #
+    # DEVICE IS NOT OPTIONAL HERE.  `torch.tensor(...)` defaults to CPU, and every
+    # Triton pointer argument must be device-accessible: the runtime rejects a host
+    # tensor with
+    #     ValueError: Pointer argument (at N) cannot be accessed from Triton
+    #                (cpu tensor?)
+    # (triton-ascend .../third_party/ascend/backend/driver.py:565, which reads
+    # `aclrtPointerGetAttributes(ptr).location.type` and requires DEVICE).
+    # So the caller MUST say which device the kernel works on, and we convert
+    # straight onto it.  We deliberately do NOT default to `.cpu()` nor call
+    # `.npu()`: the first is what broke qwen27 v4, and the second hard-codes a
+    # backend into a file that is also imported on other platforms.
+    #
+    # Convert tuple/list to a tensor (numerically identical values); pass every
+    # other type through unchanged so behaviour is not altered.  Explicit `raise`
+    # rather than `assert` (-O would strip an assert), and the message carries the
+    # actual type/shape so the next occurrence is diagnosable at a glance.
+    #
+    # EVERY RETURN PATH IS GUARDED (T-059 follow-up).  An earlier revision checked
+    # only the tuple branch, so an already-materialised CPU tensor was returned
+    # untouched and reached Triton anyway -- the guard knew the risk but did not
+    # cover the whole function.  A guard is only as good as the paths it covers.
+    if isinstance(value, torch.Tensor):
+        _require_device_tensor(value, name)
+        return value
+    if isinstance(value, (tuple, list)):
+        if device is None:
+            raise ValueError(
+                "%s must be converted onto a device, but device=None was passed. "
+                "A Triton kernel pointer argument may not be a host tensor "
+                "(runtime error: 'Pointer argument (at N) cannot be accessed from "
+                "Triton (cpu tensor?)')." % (name,)
+            )
+        return torch.tensor(value, dtype=torch.int64, device=device)
+    if value is None:
+        return None
+    raise TypeError(
+        "%s must be a torch.Tensor, tuple/list, or None, but got %s (%r). "
+        "A Triton kernel argument is type-mangled via `.dtype`, so a non-tensor "
+        "raises AttributeError: 'tuple' object has no attribute 'dtype'."
+        % (name, type(value).__name__, value)
+    )
+
+
+def _guard_reusable_chunk_offsets(chunk_offsets, cu_seqlens_kern, chunk_size, keep_meta):
+    # Guard for the reuse below.  The metadata table was built from the original
+    # `cu_seqlens`, so it is only interchangeable with the compacted kernel view
+    # when nothing was dropped.  If that invariant breaks we must fail loudly:
+    # silently passing a stale table makes the kernel read the wrong chunk base.
+    #
+    # This deliberately uses explicit `raise` and never `assert`, because `assert`
+    # is stripped under `python -O` and the failure mode here is a silent wrong
+    # answer rather than a crash.  The check must therefore always run.
+    #
+    # ---------------------------------------------------------------------------
+    # T-073 (V2): this check no longer READS THE DEVICE TABLE.
+    #
+    # `chunk_size` remains in the signature for call-site stability, but the check
+    # no longer recomputes the cdiv recurrence, so it is intentionally unused here.
+    #
+    # It used to do `chunk_offsets.tolist()` and compare every entry against the
+    # cumsum recurrence.  That is a device->host copy, i.e. a synchronising device
+    # access on the generation path -- exactly what 507015 / "MTE DDR out of range"
+    # was reported inside (copy_between_host_and_device_opapi).  It was also the
+    # FIRST device data access of the step: this guard is called at L257, before the
+    # cu_seqlens H2D argument at L278.
+    #
+    # The check is now pure host-side integer arithmetic on values we already hold.
+    # WHY THAT IS STILL A REAL CHECK (not a weakening):
+    #   _compact_empty_segments (gdn_attn_builder.py:158-170) returns keep_meta=None
+    #   if and only if NO empty segment was dropped:
+    #       if bool(keep.all()):  return cu_seqlens_host, initial_state, None
+    #   so in this branch (we already returned when keep_meta is not None) the
+    #   kernel's `cu_seqlens_kern` IS the very list the metadata table was built
+    #   from.  The lengths must therefore agree, and a disagreement means the
+    #   builder and this consumer have diverged -- which is what we must catch.
+    #
+    # WHAT IS NO LONGER CHECKED (stated so nobody assumes otherwise):
+    #   the table's CONTENT.  Comparing values cannot be done without the device
+    #   copy we are removing.  The remaining exposure is "the builder produced a
+    #   table whose length is right but whose values are wrong"; that is the
+    #   builder's invariant to hold, and V4 (builder self-validates on the host and
+    #   passes the verdict down with the metadata) is the clean way to restore it.
+    # ---------------------------------------------------------------------------
+    if chunk_offsets is None or keep_meta is not None:
+        return
+    if cu_seqlens_kern is None or len(cu_seqlens_kern) < 2:
+        raise ValueError(
+            "D-1 chunk_offsets reuse is not applicable: expected at least one sequence in "
+            "cu_seqlens_kern but got %r.  Note: the keep_meta is not None branch is not covered by D-1."
+            % (cu_seqlens_kern,)
+        )
+    # prepare_chunk_offsets returns cat([0], cdiv(lens, CS)).cumsum(-1), i.e. one
+    # entry per segment plus a trailing sentinel, so len(table) == len(cu_seqlens).
+    #
+    # `chunk_offsets.numel()` is host-visible metadata (it needs no device read),
+    # which is what keeps this guard free of any H2D/D2H copy.
+    n_segments = len(cu_seqlens_kern) - 1
+    if chunk_offsets.numel() != n_segments + 1:
+        raise ValueError(
+            "D-1 chunk_offsets reuse would be wrong: metadata table has %d entries but "
+            "cu_seqlens_kern decodes to %d sequences, so %d entries are required when "
+            "keep_meta is None.  Note: the keep_meta is not None branch is not covered by D-1."
+            % (chunk_offsets.numel(), n_segments, n_segments + 1)
+        )
+    # Host-side sanity on the very list the table was built from: a varlen
+    # cu_seqlens is non-decreasing, and a negative or out-of-order entry would make
+    # the cdiv recurrence meaningless.  This costs no device access.
+    prev = int(cu_seqlens_kern[0])
+    if prev < 0:
+        raise ValueError(
+            "D-1 chunk_offsets reuse is not applicable: cu_seqlens_kern[0] is %d, but varlen "
+            "sequence starts must be >= 0." % prev
+        )
+    for i in range(len(cu_seqlens_kern) - 1):
+        cur = int(cu_seqlens_kern[i + 1])
+        if cur < prev:
+            raise ValueError(
+                "D-1 chunk_offsets reuse is not applicable: cu_seqlens_kern is not non-decreasing "
+                "at index %d (%d then %d), so the chunk-offset recurrence is undefined."
+                % (i + 1, prev, cur)
+            )
+        prev = cur
+
+
+
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -87,11 +254,11 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64,
     )
 
-    k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
-    w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
-    u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
+    k_ascendc = k.to(torch.bfloat16).contiguous()
+    w_ascendc = w.to(torch.bfloat16).contiguous()
+    u_ascendc = u.to(torch.bfloat16).contiguous()
     g_ascendc = g.transpose(1, 2).contiguous()
-    q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
+    q_ascendc = q.to(torch.bfloat16).contiguous()
 
     cu_seqlens = None if cu_seqlens is None else cu_seqlens.to(torch.int64)
     chunk_indices = None if chunk_indices_chunk64 is None else chunk_indices_chunk64.to(torch.int64)
@@ -112,7 +279,20 @@ def chunk_gated_delta_rule_fwd(
     else:
         cu_seqlens_kern, initial_state_kern = cu_seqlens_host, initial_state
         keep_meta = None
-    h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
+    # D-1: reuse the chunk offset table that the metadata builder already
+    # computed (gdn_attn_builder.py:189) instead of letting the callee redo it.
+    # The callee would otherwise take its `if chunk_offsets is None` branch and
+    # call prepare_chunk_offsets(), which evaluates `triton.cdiv` over an NPU
+    # tensor on the first request that reaches this Python implementation.
+    # Reuse is only valid when nothing was compacted away: with keep_meta set,
+    # cu_seqlens_kern is the shorter, zero-length-segment-free view while the
+    # table was built from the original cu_seqlens, so the two disagree and the
+    # callee must be left to recompute (that branch is NOT covered by D-1).
+    # Pass None when there is no prebuilt metadata at all; that keeps the
+    # legacy recompute path byte-for-byte unchanged.
+    chunk_offsets_kern = chunk_offsets_chunk64 if keep_meta is None else None
+    _guard_reusable_chunk_offsets(chunk_offsets_kern, cu_seqlens_kern, chunk_size=64, keep_meta=keep_meta)
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k_ascendc,
         w_ascendc,
         u_ascendc,
@@ -122,8 +302,23 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=True,
         chunk_size=64,
         save_new_value=True,
-        cu_seqlens=cu_seqlens_kern,
-        chunk_indices=chunk_indices_chunk64_host,
+        # The kernel indexes `k` with these values (`k[k_seqlen_offs...]`), so the
+        # lengths must live on the device `k` is on -- a host tensor is rejected by
+        # the Triton runtime ("Pointer argument (at 8) cannot be accessed from
+        # Triton (cpu tensor?)").  `k_ascendc` is a device tensor by construction
+        # (L187), so its device is the right target and it is always available here.
+        #
+        # T-059: assert that the device SOURCE is itself on the device.  If `k` ever
+        # arrives on CPU then every tensor derived from it is on CPU too, and the
+        # failure would only surface deep inside Triton as "Pointer argument (at N)".
+        # Checking here names the real culprit at the call that caused it.
+        cu_seqlens=_as_tensor_arg(
+            cu_seqlens_kern,
+            "cu_seqlens_kern",
+            _require_device_tensor(k_ascendc, "k_ascendc").device,
+        ),
+        chunk_indices=chunk_indices_chunk64,
+        chunk_offsets=chunk_offsets_kern,
         use_exp2=False,
         transpose_state_layout=False,
     )
@@ -191,26 +386,82 @@ def chunk_gated_delta_rule_fwd(
                 chunk_indices=chunk_indices_chunk64,
                 chunk_offsets=chunk_offsets_chunk64,
             )
-            h = h.transpose(1, 2).contiguous()
-            v_new = v_new.transpose(1, 2).contiguous()
+            h = h.contiguous()
+            v_new = v_new.contiguous()
 
-    o_ascendc = torch.ops._C_ascend.chunk_fwd_o(
-        q_ascendc,
-        k_ascendc,
-        v_new,
-        h,
-        scale,
-        g=g_ascendc,
-        g_gamma=None,
-        cu_seqlens=cu_seqlens_host,
-        chunk_indices=chunk_indices_chunk64_host,
+    # T-060: this call site was written against a DIFFERENT signature than the
+    # implementation that is actually loaded (impl/fla/chunk_o.py:112):
+    #     def chunk_fwd_o(q, k, v, h, g=None, scale=None, cu_seqlens=None,
+    #                     chunk_size=64, chunk_offsets=None)
+    # The old form passed `scale` POSITIONALLY as the 5th argument, which lands in
+    # `g`, while also passing g=... -> TypeError: got multiple values for 'g'.
+    # It additionally passed g_gamma= / chunk_indices= / transpose_state_layout=,
+    # none of which exist in this signature.
+    #
+    # Everything is now passed BY KEYWORD so that a signature change can never
+    # silently re-map an argument again; positional passing is exactly how this
+    # broke.
+    #
+    #   g            <- g_ascendc           (the gate; chunk_o.py takes it ALREADY HEAD-FIRST: its kernel
+#                                        indexes `g + bos + i_h * T_max`, i.e. [H,T], and it must NOT
+#                                        transpose again.  Contract: the island owns g's transpose; the
+#                                        callee owns nothing.  For k/w/u/q the island must NOT transpose,
+#                                        because their kernels index them token-major.
+#
+# CONTRACT (final; matches the upstream vllm_ascend tree):
+#   * the island transposes ONLY `g`;  q, k, w, u, v and the outputs stay TOKEN-MAJOR;
+#   * every callee derives its dimensions from that token-major layout and does NOT transpose `g`
+#     itself (chunk_delta_h / chunk_o / chunk_delta_hupdate all index `g + bos + i_h * T_max`, i.e. [H,T],
+#     which is exactly what the island's single transpose produces).
+#   * callees without the island's transposes (wy_fast, chunk_scaled_dot_kkt) receive raw `g` and
+#     normalise it internally -- same rule, one owner per boundary.
+#                                        because their kernels index them token-major.)
+    #   scale        <- scale               (the caller's real scale, not the
+    #                                        k.shape[-1]**-0.5 fallback at :128)
+    #   cu_seqlens   <- cu_seqlens_kern     (must be a DEVICE TENSOR: the callee
+    #                                        does `len(cu_seqlens)` at :134 and
+    #                                        `prepare_chunk_offsets(cu_seqlens, BT)`
+    #                                        at :136, and that does
+    #                                        `cu_seqlens.new_tensor(...)` -- a tuple
+    #                                        would blow up there; a CPU tensor would
+    #                                        hit the T-059 pointer check)
+    #   chunk_offsets<- chunk_offsets_kern  (the table the builder already made)
+    #
+    # Why chunk_offsets replaces the old chunk_indices=: the callee's only index
+    # input is chunk_offsets (:136 computes it, :150 forwards it) and its kernel
+    # takes chunk_offsets, not chunk_indices -- chunk location is derived from
+    # cu_seqlens + chunk_offsets.  Passing the prebuilt table also avoids
+    # `prepare_chunk_offsets()` running triton.cdiv over an NPU tensor at capture
+    # time, which is the very thing D-1 exists to avoid.
+    #
+    # g_gamma= is dropped: nothing in the deployed ascend tree declares that
+    # parameter -- the only occurrence of the name is this former call -- and the
+    # callee only needs g to be non-None.
+    # transpose_state_layout= is dropped: it belongs to the chunk_delta_h state
+    # layout switch, which chunk_fwd_o neither accepts nor uses.
+    #
+    # chunk_offsets_kern is already "the table to use, or None when it does not
+    # match" (L256), so it is passed as-is rather than re-deriving the keep_meta
+    # condition here -- duplicating that test is how the two copies drift apart.
+    o_ascendc = chunk_fwd_o(
+        q=_require_device_tensor(q_ascendc, "q_ascendc"),
+        k=_require_device_tensor(k_ascendc, "k_ascendc"),
+        v=_require_device_tensor(v_new, "v_new"),
+        h=_require_device_tensor(h, "h"),
+        g=_require_device_tensor(g_ascendc, "g_ascendc"),
+        scale=scale,
+        cu_seqlens=_as_tensor_arg(
+            cu_seqlens_kern,
+            "cu_seqlens_kern",
+            _require_device_tensor(q_ascendc, "q_ascendc").device,
+        ),
         chunk_size=64,
-        transpose_state_layout=False,
+        chunk_offsets=chunk_offsets_kern,
     )
 
-    o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
-    v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
-    h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
+    o = o_ascendc.to(torch.bfloat16).contiguous()
+    v_new = v_new.to(torch.bfloat16).contiguous()
+    h = h.to(torch.bfloat16).contiguous()
 
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
