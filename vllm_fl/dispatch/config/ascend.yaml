@@ -90,6 +90,7 @@ flagos_blacklist:
   - fill_tensor_
   - conv1d
   - conv2d
+  - conv3d # Qwen3-VL vision patch-embed; FlagGems conv3d hangs the NPU
   - uniform_
   - prod
   - max

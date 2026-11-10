@@ -746,18 +746,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if len(kv_cache) > 1:
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+            num_tokens = attn_metadata.num_actual_tokens
             slots = attn_metadata.slot_mapping
-            # torch_npu requires int32 for slot_indices
-            # TODO(yxa): block_table.py: CUDA uses int64, NPU uses int32.
+            key_tokens = key[:num_tokens]
+            value_tokens = value[:num_tokens]
+            from .triton_ops.cache import triton_reshape_and_cache
+
+            # The Triton kernel rebuilds the element address from the paged
+            # cache strides, so it keeps the caller's int64 slot ids and the
+            # full int64 element span; a padded token's negative slot is
+            # skipped instead of being narrowed.
+            if triton_reshape_and_cache(
+                key_tokens,
+                value_tokens,
+                self.key_cache,
+                self.value_cache,
+                slots[:num_tokens],
+            ):
+                return key, value
+            # torch_npu requires int32 for slot_indices; CUDA uses int64 here.
             if slots.dtype != torch.int32:
                 slots = slots.to(torch.int32)
             # Use torch_npu reshape_and_cache
             torch_npu._npu_reshape_and_cache(
-                key=key[:attn_metadata.num_actual_tokens],
-                value=value[:attn_metadata.num_actual_tokens],
+                key=key_tokens,
+                value=value_tokens,
                 key_cache=self.key_cache,
                 value_cache=self.value_cache,
-                slot_indices=slots[:attn_metadata.num_actual_tokens]
+                slot_indices=slots[:num_tokens]
             )
         return key, value
 

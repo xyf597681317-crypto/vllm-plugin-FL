@@ -12,7 +12,18 @@ import torch_npu
 
 
 def topk_softmax(topk_weights, topk_ids, token_expert_indices, gating_output, renormalize):
-    """Tensor reference for FL's softmax router; its scratch output is unused."""
+    """Softmax router: the Triton `MoeGatingTopK` port, with the tensor path kept.
+
+    The Triton kernel writes both preallocated outputs in place when the layout
+    is supported (see `triton_ops/routing.py`); otherwise the torch reference
+    below runs unchanged, so a non-contiguous or int64-id call still works and
+    the public signature and return value stay the same.
+    """
+    from .triton_ops.routing import triton_topk_softmax
+
+    if triton_topk_softmax(topk_weights, topk_ids, gating_output, renormalize):
+        return topk_weights, topk_ids
+
     scores = gating_output.float().softmax(dim=-1)
     weights, indices = scores.topk(topk_weights.shape[-1], dim=-1)
     if renormalize:
@@ -20,6 +31,68 @@ def topk_softmax(topk_weights, topk_ids, token_expert_indices, gating_output, re
     topk_weights.copy_(weights)
     topk_ids.copy_(indices.to(topk_ids.dtype))
     return topk_weights, topk_ids
+
+
+def _moe_init_routing(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    global_num_experts: int,
+    first_expert: int,
+    num_experts: int,
+):
+    """Group routes by expert id; `routed, row_indices, expert_tokens`.
+
+    The Triton kernel covers the full-active-range layout this vendor path uses
+    (count mode, every route kept).  A sharded expert range keeps the packaged
+    operator, whose -1 sentinel and truncated range the kernel does not model.
+    """
+    from .triton_ops.routing import triton_moe_init_routing
+
+    fused = triton_moe_init_routing(
+        hidden_states, topk_ids, global_num_experts, first_expert, num_experts
+    )
+    if fused is not None:
+        return fused
+
+    import torch_npu
+
+    routed, row_indices, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
+        hidden_states,
+        topk_ids.to(torch.int32),
+        active_num=hidden_states.size(0) * topk_ids.size(1),
+        expert_num=global_num_experts,
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        active_expert_range=[first_expert, first_expert + num_experts],
+        quant_mode=-1,
+    )
+    return routed, row_indices, expert_tokens
+
+
+def _moe_token_unpermute(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    probs: torch.Tensor,
+) -> torch.Tensor:
+    """Weighted scatter-reduce of the expert rows back to token rows.
+
+    The Triton kernel covers the layout produced by ``npu_moe_init_routing_v2``
+    above; every other layout keeps the packaged torch_npu operator, so the
+    numerical contract of the vendor path is unchanged.
+    """
+    from .triton_ops.moe import triton_moe_token_unpermute
+
+    fused = triton_moe_token_unpermute(permuted_tokens, sorted_indices, probs)
+    if fused is not None:
+        return fused
+
+    import torch_npu
+
+    return torch_npu.npu_moe_token_unpermute(
+        permuted_tokens=permuted_tokens,
+        sorted_indices=sorted_indices,
+        probs=probs,
+    )
 
 
 def _torch_fused_experts_impl(
@@ -69,15 +142,8 @@ def _torch_fused_experts_impl(
     # The current rc1 dispatcher uses count-mode expert tokens and pairs its
     # init-routing interface with token_unpermute (not finalize_routing).
     # Use global IDs with a contiguous local range, including nonzero offsets.
-    routed, row_indices, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
-        hidden_states,
-        topk_ids.to(torch.int32),
-        active_num=num_tokens * topk_ids.size(1),
-        expert_num=global_num_experts,
-        expert_tokens_num_type=1,
-        expert_tokens_num_flag=True,
-        active_expert_range=[first_expert, first_expert + num_experts],
-        quant_mode=-1,
+    routed, row_indices, expert_tokens = _moe_init_routing(
+        hidden_states, topk_ids, global_num_experts, first_expert, num_experts
     )
     group_list = expert_tokens.to(torch.int64)
     # vLLM retains [E, N, K] weights. GMM expects [E, K, N]; match
@@ -113,11 +179,7 @@ def _torch_fused_experts_impl(
         sorted_indices = row_indices.clamp_min(0)
     else:
         sorted_indices = torch.abs(row_indices)
-    result = torch_npu.npu_moe_token_unpermute(
-        permuted_tokens=expert_output,
-        sorted_indices=sorted_indices,
-        probs=topk_weights,
-    )
+    result = _moe_token_unpermute(expert_output, sorted_indices, topk_weights)
     if inplace:
         hidden_states.copy_(result)
         return hidden_states
